@@ -31,13 +31,17 @@ _search_client = SearchClient(
 )
 
 
+def _safe(text: str, limit: int = 120) -> str:
+    """Truncate and strip non-ASCII for safe console printing on Windows."""
+    return text[:limit].replace("\n", " ").encode("ascii", "replace").decode("ascii")
+
+
 async def _search(query: str, top: int = 5) -> str:
     print(f"[TOOL] Azure AI Search | query: \"{query}\"")
     results = await _search_client.search(query, top=top)
     chunks = [doc["chunk"] async for doc in results if doc.get("chunk")]
     output = "\n\n".join(chunks) if chunks else "No results found."
-    preview = output[:120].replace("\n", " ")
-    print(f"         ->{len(chunks)} chunk(s) returned | preview: {preview}...")
+    print(f"         -> {len(chunks)} chunk(s) returned | preview: {_safe(output)}...")
     return output
 
 
@@ -46,14 +50,12 @@ def _web_search(query: str, max_results: int = 5) -> str:
     with DDGS() as ddgs:
         results = list(ddgs.text(query, max_results=max_results))
     if not results:
-        print("         ->0 results returned")
+        print("         -> 0 results returned")
         return "No web results found."
-    parts = []
-    for r in results:
-        parts.append(f"**{r['title']}**\n{r['href']}\n{r['body']}")
+    parts = [f"**{r['title']}**\n{r['href']}\n{r['body']}" for r in results]
     output = "\n\n".join(parts)
-    preview = results[0]['title'] + " — " + results[0]['body'][:80].replace("\n", " ")
-    print(f"         ->{len(results)} result(s) returned | top: {preview}...")
+    preview = _safe(results[0]['title'] + " - " + results[0]['body'])
+    print(f"         -> {len(results)} result(s) returned | top: {preview}...")
     return output
 
 
@@ -277,4 +279,13 @@ with gr.Blocks(title="Power Platform Licensing Assistant") as demo:
 
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=False, theme=gr.themes.Soft())
+    import socket
+    def _find_free_port(start=7860, end=7880):
+        for port in range(start, end):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                if s.connect_ex(("127.0.0.1", port)) != 0:
+                    return port
+        return start
+    port = _find_free_port()
+    print(f"[INFO] Starting on port {port}")
+    demo.launch(server_name="0.0.0.0", server_port=port, share=False, theme=gr.themes.Soft())
