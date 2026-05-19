@@ -3,18 +3,13 @@
 from dotenv import load_dotenv
 load_dotenv()
 
+import json
 import os
-import asyncio
-from dataclasses import dataclass
-from typing import Annotated
 
 import gradio as gr
-from agent_framework import AgentResponseUpdate
-from agent_framework_openai import OpenAIChatClient
-from azure.identity import AzureCliCredential
-from semantic_kernel.connectors.azure_ai_search import AzureAISearchCollection
-from semantic_kernel.data import VectorStoreRecordKeyField, VectorStoreRecordDataField
-from semantic_kernel.functions import KernelParameterMetadata
+from azure.core.credentials import AzureKeyCredential
+from azure.search.documents.aio import SearchClient
+from openai import AsyncOpenAI
 
 # Ensure Azure CLI is on PATH
 os.environ["PATH"] += r";C:\Program Files (x86)\Microsoft SDKs\Azure\CLI2\wbin"
@@ -25,117 +20,114 @@ API_KEY         = os.environ["AZURE_OPENAI_API_KEY"]
 SEARCH_ENDPOINT = os.environ["AZURE_SEARCH_ENDPOINT"]
 SEARCH_API_KEY  = os.environ["AZURE_SEARCH_API_KEY"]
 SEARCH_INDEX    = os.environ["AZURE_SEARCH_INDEX"]
-TENANT_ID       = os.environ["AZURE_TENANT_ID"]
 
 
-# ── Data model for the Power Platform Licensing Guide index ───────────────────
-@dataclass
-class PowerPlatformDoc:
-    id:      Annotated[str,      VectorStoreRecordKeyField()]
-    content: Annotated[str | None, VectorStoreRecordDataField()] = None
-
-
-# ── Build search tool ─────────────────────────────────────────────────────────
-_collection = AzureAISearchCollection[str, PowerPlatformDoc](
-    record_type=PowerPlatformDoc,
-    collection_name=SEARCH_INDEX,
-    search_endpoint=SEARCH_ENDPOINT,
-    api_key=SEARCH_API_KEY,
+# ── Search tool ───────────────────────────────────────────────────────────────
+_search_client = SearchClient(
+    endpoint=SEARCH_ENDPOINT,
+    index_name=SEARCH_INDEX,
+    credential=AzureKeyCredential(SEARCH_API_KEY),
 )
 
-_search_function = _collection.create_search_function(
-    function_name="search_power_platform_licensing",
-    description=(
-        "Search the Power Platform Licensing Guide for licensing information, "
-        "pricing, plans, entitlements, and policies."
-    ),
-    search_type="keyword",
-    parameters=[
-        KernelParameterMetadata(
-            name="query",
-            description="The search query to find relevant licensing information.",
-            type="str",
-            is_required=True,
-            type_object=str,
-        ),
-        KernelParameterMetadata(
-            name="top",
-            description="Number of results to return.",
-            type="int",
-            default_value=5,
-            type_object=int,
-        ),
-    ],
-    string_mapper=lambda x: x.record.content or "",
-)
 
-_search_tool = _search_function.as_agent_framework_tool()
+async def _search(query: str, top: int = 5) -> str:
+    results = await _search_client.search(query, top=top)
+    chunks = [doc["chunk"] async for doc in results if doc.get("chunk")]
+    return "\n\n".join(chunks) if chunks else "No results found."
 
-_INSTRUCTIONS = (
+
+_SEARCH_TOOL_DEF = {
+    "type": "function",
+    "function": {
+        "name": "search_power_platform_licensing",
+        "description": (
+            "Search the Power Platform Licensing Guide for licensing information, "
+            "pricing, plans, entitlements, and policies."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "The search query"},
+                "top":   {"type": "integer", "description": "Number of results to return", "default": 5},
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+_SYSTEM_PROMPT = (
     "You are a Microsoft Power Platform licensing specialist. "
     "Always use the search tool to retrieve relevant content from the Power Platform Licensing Guide "
     "before answering. Base your answers strictly on the retrieved content. "
     "Cite relevant sections where helpful."
 )
 
-# ── Build one agent per model ─────────────────────────────────────────────────
-credential = AzureCliCredential(tenant_id=TENANT_ID)
-
-AGENTS = {
-    "DeepSeek-V3.2": OpenAIChatClient(
-        model="DeepSeek-V3.2",
-        api_key=API_KEY,
-        base_url=BASE_URL,
-    ).as_agent(
-        name="rag_deepseek",
-        instructions=_INSTRUCTIONS,
-        tools=[_search_tool],
-    ),
-    "gpt-4o-mini": OpenAIChatClient(
-        model="gpt-4o-mini",
-        api_key=API_KEY,
-        base_url=BASE_URL,
-    ).as_agent(
-        name="rag_gpt4o",
-        instructions=_INSTRUCTIONS,
-        tools=[_search_tool],
-    ),
-}
+_client = AsyncOpenAI(api_key=API_KEY, base_url=BASE_URL)
 
 
 # ── Gradio handlers ───────────────────────────────────────────────────────────
-async def user_submit(message: str, history: list, sessions: dict):
-    """Immediately append the user message and clear the input box."""
-    history = history + [[message, None]]
-    return "", history, sessions
+async def user_submit(message: str, history: list):
+    history = history + [{"role": "user", "content": message}]
+    return "", history
 
 
-async def bot_respond(history: list, model: str, sessions: dict):
-    """Stream the agent response token by token."""
-    agent = AGENTS[model]
-    user_message = history[-1][0]
+async def bot_respond(history: list, model: str):
+    """Agentic loop: handle tool calls then stream the final answer."""
+    messages = [{"role": "system", "content": _SYSTEM_PROMPT}] + history
+    history = history + [{"role": "assistant", "content": ""}]
 
-    # Maintain one session per model so conversation history is preserved
-    if model not in sessions:
-        sessions[model] = agent.create_session()
-    session = sessions[model]
+    # Tool call loop (non-streaming until no more tool calls)
+    while True:
+        resp = await _client.chat.completions.create(
+            model=model,
+            messages=messages,
+            tools=[_SEARCH_TOOL_DEF],
+            tool_choice="auto",
+        )
+        choice = resp.choices[0]
 
-    history[-1][1] = ""
-    async for event in agent.run(user_message, session=session, stream=True):
-        if isinstance(event, AgentResponseUpdate) and event.text:
-            history[-1][1] += event.text
-            yield history, sessions
+        if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
+            messages.append({
+                "role": "assistant",
+                "content": choice.message.content,
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                    }
+                    for tc in choice.message.tool_calls
+                ],
+            })
+            for tc in choice.message.tool_calls:
+                args = json.loads(tc.function.arguments)
+                result = await _search(**args)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result,
+                })
+        else:
+            break
+
+    # Stream the final answer
+    stream = await _client.chat.completions.create(
+        model=model,
+        messages=messages,
+        stream=True,
+    )
+    async for chunk in stream:
+        if chunk.choices and chunk.choices[0].delta.content:
+            history[-1]["content"] += chunk.choices[0].delta.content
+            yield history
 
 
 def clear_chat():
-    return [], {}
+    return []
 
 
 # ── Gradio UI ─────────────────────────────────────────────────────────────────
-with gr.Blocks(
-    title="Power Platform Licensing Assistant",
-    theme=gr.themes.Soft(),
-) as demo:
+with gr.Blocks(title="Power Platform Licensing Assistant") as demo:
 
     gr.Markdown(
         """
@@ -152,14 +144,9 @@ with gr.Blocks(
             label="Model",
             scale=1,
         )
-        gr.Markdown("", scale=3)  # spacer
+        gr.Markdown("")
 
-    chatbot = gr.Chatbot(
-        label="Conversation",
-        height=520,
-        bubble_full_width=False,
-        show_copy_button=True,
-    )
+    chatbot = gr.Chatbot(label="Conversation", height=520)
 
     with gr.Row():
         msg_box = gr.Textbox(
@@ -172,38 +159,32 @@ with gr.Blocks(
 
     clear_btn = gr.Button("Clear conversation", variant="secondary")
 
-    sessions = gr.State({})  # persists {model_name: AgentSession} per browser tab
-
-    # Wire up submit (Enter key or Send button)
-    submit_event = (
-        msg_box.submit(
-            user_submit,
-            inputs=[msg_box, chatbot, sessions],
-            outputs=[msg_box, chatbot, sessions],
-        ).then(
-            bot_respond,
-            inputs=[chatbot, model_selector, sessions],
-            outputs=[chatbot, sessions],
-        )
+    msg_box.submit(
+        user_submit,
+        inputs=[msg_box, chatbot],
+        outputs=[msg_box, chatbot],
+    ).then(
+        bot_respond,
+        inputs=[chatbot, model_selector],
+        outputs=[chatbot],
     )
 
     send_btn.click(
         user_submit,
-        inputs=[msg_box, chatbot, sessions],
-        outputs=[msg_box, chatbot, sessions],
+        inputs=[msg_box, chatbot],
+        outputs=[msg_box, chatbot],
     ).then(
         bot_respond,
-        inputs=[chatbot, model_selector, sessions],
-        outputs=[chatbot, sessions],
+        inputs=[chatbot, model_selector],
+        outputs=[chatbot],
     )
 
-    clear_btn.click(clear_chat, outputs=[chatbot, sessions])
+    clear_btn.click(clear_chat, outputs=[chatbot])
 
     gr.Markdown(
-        "_Switching models mid-conversation starts a fresh session for that model. "
-        "Switching back resumes the previous session._"
+        "_Switching models mid-conversation starts a fresh context for that model._"
     )
 
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=False)
+    demo.launch(server_name="0.0.0.0", server_port=7860, share=False, theme=gr.themes.Soft())
