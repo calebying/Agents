@@ -32,20 +32,29 @@ _search_client = SearchClient(
 
 
 async def _search(query: str, top: int = 5) -> str:
+    print(f"[TOOL] Azure AI Search | query: \"{query}\"")
     results = await _search_client.search(query, top=top)
     chunks = [doc["chunk"] async for doc in results if doc.get("chunk")]
-    return "\n\n".join(chunks) if chunks else "No results found."
+    output = "\n\n".join(chunks) if chunks else "No results found."
+    preview = output[:120].replace("\n", " ")
+    print(f"         ->{len(chunks)} chunk(s) returned | preview: {preview}...")
+    return output
 
 
 def _web_search(query: str, max_results: int = 5) -> str:
+    print(f"[TOOL] DuckDuckGo Web Search | query: \"{query}\"")
     with DDGS() as ddgs:
         results = list(ddgs.text(query, max_results=max_results))
     if not results:
+        print("         ->0 results returned")
         return "No web results found."
     parts = []
     for r in results:
         parts.append(f"**{r['title']}**\n{r['href']}\n{r['body']}")
-    return "\n\n".join(parts)
+    output = "\n\n".join(parts)
+    preview = results[0]['title'] + " — " + results[0]['body'][:80].replace("\n", " ")
+    print(f"         ->{len(results)} result(s) returned | top: {preview}...")
+    return output
 
 
 _TOOLS = [
