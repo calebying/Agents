@@ -9,6 +9,7 @@ import os
 import gradio as gr
 from azure.core.credentials import AzureKeyCredential
 from azure.search.documents.aio import SearchClient
+from ddgs import DDGS
 from openai import AsyncOpenAI
 
 # Ensure Azure CLI is on PATH
@@ -36,30 +37,62 @@ async def _search(query: str, top: int = 5) -> str:
     return "\n\n".join(chunks) if chunks else "No results found."
 
 
-_SEARCH_TOOL_DEF = {
-    "type": "function",
-    "function": {
-        "name": "search_power_platform_licensing",
-        "description": (
-            "Search the Power Platform Licensing Guide for licensing information, "
-            "pricing, plans, entitlements, and policies."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "The search query"},
-                "top":   {"type": "integer", "description": "Number of results to return", "default": 5},
+def _web_search(query: str, max_results: int = 5) -> str:
+    with DDGS() as ddgs:
+        results = list(ddgs.text(query, max_results=max_results))
+    if not results:
+        return "No web results found."
+    parts = []
+    for r in results:
+        parts.append(f"**{r['title']}**\n{r['href']}\n{r['body']}")
+    return "\n\n".join(parts)
+
+
+_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_power_platform_licensing",
+            "description": (
+                "Search the Power Platform Licensing Guide for licensing information, "
+                "pricing, plans, entitlements, and policies."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The search query"},
+                    "top":   {"type": "integer", "description": "Number of results to return", "default": 5},
+                },
+                "required": ["query"],
             },
-            "required": ["query"],
         },
     },
-}
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": (
+                "Search the internet via DuckDuckGo for current information, news, "
+                "general knowledge, or anything not covered by the Power Platform Licensing Guide."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query":       {"type": "string",  "description": "The search query"},
+                    "max_results": {"type": "integer", "description": "Number of results to return", "default": 5},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+]
+
 
 _SYSTEM_PROMPT = (
-    "You are a Microsoft Power Platform licensing specialist. "
-    "Always use the search tool to retrieve relevant content from the Power Platform Licensing Guide "
-    "before answering. Base your answers strictly on the retrieved content. "
-    "Cite relevant sections where helpful."
+    "You are a helpful assistant with two search tools:\n"
+    "1. search_power_platform_licensing — searches the Power Platform Licensing Guide (use for licensing questions)\n"
+    "2. web_search — searches the internet via DuckDuckGo (use for general or current information)\n"
+    "Always use the most appropriate tool before answering. Cite sources where helpful."
 )
 
 _client = AsyncOpenAI(api_key=API_KEY, base_url=BASE_URL)
@@ -81,7 +114,7 @@ async def bot_respond(history: list, model: str):
         resp = await _client.chat.completions.create(
             model=model,
             messages=messages,
-            tools=[_SEARCH_TOOL_DEF],
+            tools=_TOOLS,
             tool_choice="auto",
         )
         choice = resp.choices[0]
@@ -101,7 +134,10 @@ async def bot_respond(history: list, model: str):
             })
             for tc in choice.message.tool_calls:
                 args = json.loads(tc.function.arguments)
-                result = await _search(**args)
+                if tc.function.name == "search_power_platform_licensing":
+                    result = await _search(**args)
+                else:
+                    result = _web_search(**args)
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
@@ -133,7 +169,7 @@ with gr.Blocks(title="Power Platform Licensing Assistant") as demo:
         """
         # Power Platform Licensing Assistant
         Ask questions about Microsoft Power Platform licensing, plans, pricing, and entitlements.
-        Powered by the **Power Platform Licensing Guide** via Azure AI Search RAG.
+        Powered by **Azure AI Search RAG** (licensing guide) + **DuckDuckGo** (internet search).
         """
     )
 
