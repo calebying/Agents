@@ -115,56 +115,82 @@ async def user_submit(message: str, history: list):
 
 async def bot_respond(history: list, model: str):
     """Agentic loop: handle tool calls then stream the final answer."""
+    from openai import BadRequestError
+
     messages = [{"role": "system", "content": _SYSTEM_PROMPT}] + history
     history = history + [{"role": "assistant", "content": ""}]
 
-    # Tool call loop (non-streaming until no more tool calls)
-    while True:
-        resp = await _client.chat.completions.create(
+    try:
+        # Tool call loop (non-streaming until no more tool calls)
+        while True:
+            resp = await _client.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=_TOOLS,
+                tool_choice="auto",
+            )
+            choice = resp.choices[0]
+
+            if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
+                messages.append({
+                    "role": "assistant",
+                    "content": choice.message.content,
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                        }
+                        for tc in choice.message.tool_calls
+                    ],
+                })
+                for tc in choice.message.tool_calls:
+                    args = json.loads(tc.function.arguments)
+                    if tc.function.name == "search_power_platform_licensing":
+                        result = await _search(**args)
+                    else:
+                        result = _web_search(**args)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": result,
+                    })
+            else:
+                break
+
+        # Stream the final answer
+        stream = await _client.chat.completions.create(
             model=model,
             messages=messages,
-            tools=_TOOLS,
-            tool_choice="auto",
+            stream=True,
         )
-        choice = resp.choices[0]
+        async for chunk in stream:
+            if chunk.choices and chunk.choices[0].delta.content:
+                history[-1]["content"] += chunk.choices[0].delta.content
+                yield history
 
-        if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
-            messages.append({
-                "role": "assistant",
-                "content": choice.message.content,
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                    }
-                    for tc in choice.message.tool_calls
-                ],
-            })
-            for tc in choice.message.tool_calls:
-                args = json.loads(tc.function.arguments)
-                if tc.function.name == "search_power_platform_licensing":
-                    result = await _search(**args)
-                else:
-                    result = _web_search(**args)
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": result,
-                })
+    except BadRequestError as e:
+        err = e.body or {}
+        inner = err.get("innererror", {})
+        # Identify which content filter triggered
+        if inner.get("code") == "ResponsibleAIPolicyViolation":
+            filters = inner.get("content_filter_result", {})
+            triggered = [k for k, v in filters.items() if v.get("filtered") or v.get("detected")]
+            reason = ", ".join(triggered) if triggered else "policy violation"
+            msg = (
+                f"**Request blocked by Azure OpenAI content filter** ({reason}).\n\n"
+                "Your message was flagged and could not be processed. "
+                "Please rephrase your question and try again."
+            )
         else:
-            break
-
-    # Stream the final answer
-    stream = await _client.chat.completions.create(
-        model=model,
-        messages=messages,
-        stream=True,
-    )
-    async for chunk in stream:
-        if chunk.choices and chunk.choices[0].delta.content:
-            history[-1]["content"] += chunk.choices[0].delta.content
-            yield history
+            msg = f"**Request error ({e.status_code}):** {err.get('message', str(e))}"
+        print(f"[ERROR] Azure OpenAI content filter blocked request: {inner.get('code', '')} | triggered: {triggered if 'triggered' in dir() else 'unknown'}")
+        history[-1]["content"] = msg
+        yield history
+    except Exception as e:
+        print(f"[ERROR] Unexpected error in bot_respond: {e}")
+        history[-1]["content"] = f"**Unexpected error:** {e}"
+        yield history
 
 
 def clear_chat():
