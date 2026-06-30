@@ -288,4 +288,12 @@ if __name__ == "__main__":
         return start
     port = _find_free_port()
     print(f"[INFO] Starting on port {port}")
+
+    try:
+        from pyngrok import ngrok
+        tunnel = ngrok.connect(port, bind_tls=True)
+        print(f"[INFO] Public URL: {tunnel.public_url}")
+    except Exception as e:
+        print(f"[WARN] ngrok tunnel failed: {e}")
+
     demo.launch(server_name="0.0.0.0", server_port=port, share=False, theme=gr.themes.Soft())
